@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Claude Code statusline: часы, модель + effort, бары расхода лимитов 5h/7d.
+# Claude Code statusline: часы, модель + effort, занятый контекст,
+# бары расхода лимитов 5h/7d.
 # Строка 2: <имя каталога> git:<ветка>[*]
 #
 # Работает на macOS, Linux, WSL и Git Bash/MSYS/Cygwin под Windows: формат дат
@@ -63,7 +64,17 @@ fi
 
 # ── данные ────────────────────────────────────────────────────────────────────
 model=$(j '.model.display_name'); [ -z "$model" ] && model="?"
+model_full="$model"
 model="${model%% (*}"                  # "Opus 5 (1M context)" → "Opus 5"
+
+# Контекст: сколько занято из окна. Размер окна на старых версиях без
+# .context_window берём из суффикса имени модели.
+ctx_size=$(j '.context_window.context_window_size')
+if [ -z "$ctx_size" ]; then
+  case "$model_full" in *"(1M context)"*) ctx_size=1000000 ;; esac
+fi
+ctx_used=$(j '.context_window.total_input_tokens')
+ctx_pct=$(j '.context_window.used_percentage')
 
 effort=$(j '.effort.level')
 effort_part=""
@@ -124,6 +135,22 @@ color() { # цвет по зоне заполнения
   awk -v p="$1" 'BEGIN{ if(p>=80) print "91"; else if(p>=50) print "93"; else print "92" }'
 }
 
+human() { # 60754 → "61k", 1000000 → "1M"
+  awk -v n="$1" 'BEGIN{
+    if (n >= 1000000)   { v = n / 1000000; printf (v == int(v) ? "%dM" : "%.1fM"), v }
+    else if (n >= 1000) { printf "%dk", int(n / 1000 + 0.5) }
+    else if (n > 0)     { printf "%d", n }
+  }'
+}
+
+ctx() { # занято контекста: "ctx 61k/1M"
+  local c
+  [ -z "$ctx_pct" ] && return
+  c=$(color "$ctx_pct")
+  printf ' %s \033[2mctx\033[0m \033[%sm%s\033[0m' "$SEP" "$c" "$(human "$ctx_used")"
+  [ -n "$ctx_size" ] && printf '\033[2m/%s\033[0m' "$(human "$ctx_size")"
+}
+
 at() { # unix ts → "15:37" (сегодня) или "пт 18:00"
   local ts=$1 d
   [ -z "$ts" ] && return
@@ -146,6 +173,7 @@ limit() { # $1 = ярлык, $2 = занято %, $3 = resets_at
 
 printf '\033[97m%s\033[0m \033[2m%s\033[0m \033[1;96m%s\033[0m%s' \
   "$(date +%H:%M)" "$SEP" "$model" "$effort_part"
+ctx
 limit "5h" "$(j '.rate_limits.five_hour.used_percentage')"  "$(j '.rate_limits.five_hour.resets_at')"
 limit "7d" "$(j '.rate_limits.seven_day.used_percentage')"  "$(j '.rate_limits.seven_day.resets_at')"
 printf '\n'
