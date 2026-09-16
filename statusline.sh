@@ -1,17 +1,31 @@
 #!/usr/bin/env bash
 # Claude Code statusline: часы, модель + effort, занятый контекст,
-# бары расхода лимитов 5h/7d.
+# бары расхода лимитов 5h/7d и недельных лимитов отдельных моделей (Fable).
 # Строка 2: <имя каталога> git:<ветка>[*]
 #
 # Работает на macOS, Linux, WSL и Git Bash/MSYS/Cygwin под Windows: формат дат
 # и набор символов подбираются под платформу сами.
 #
-# Настройки — переменной окружения или правкой значений ниже:
+# Настройки — переменной окружения или в файле ~/.claude/statusline.env
+# (он переживает самообновление, правки в самом скрипте — нет):
 #   BAR_STYLE=auto|subcell|block|ascii   вид бара (auto: псевдографика, если терминал в UTF-8)
 #   BAR_WIDTH=10                         ширина бара в символах
+#   MODEL_LIMITS=1|0                     показывать недельные лимиты отдельных моделей (Fable и т.п.)
+#   MODEL_LIMITS_TTL=300                 как часто (сек) переспрашивать usage API (чаще нельзя: 429)
+#   SELF_UPDATE=1|0                      раз в сутки подтягивать свежую версию скрипта с GitHub
+#   SELF_UPDATE_TTL=86400                как часто (сек) проверять обновление
+
+[ -r "$HOME/.claude/statusline.env" ] && . "$HOME/.claude/statusline.env"
 
 BAR_STYLE="${BAR_STYLE:-auto}"
 BAR_WIDTH="${BAR_WIDTH:-10}"
+MODEL_LIMITS="${MODEL_LIMITS:-1}"
+MODEL_LIMITS_TTL="${MODEL_LIMITS_TTL:-300}"
+USAGE_CACHE="${USAGE_CACHE:-$HOME/.claude/cache/statusline-usage.json}"
+SELF_UPDATE="${SELF_UPDATE:-1}"
+SELF_UPDATE_TTL="${SELF_UPDATE_TTL:-86400}"
+SELF_UPDATE_URL="${SELF_UPDATE_URL:-https://raw.githubusercontent.com/Daloshka/claude-code-statusline/main/statusline.sh}"
+SELF_UPDATE_STAMP="${SELF_UPDATE_STAMP:-$HOME/.claude/cache/statusline-update.stamp}"
 WEEKDAYS="${WEEKDAYS:-пн вт ср чт пт сб вс}"
 WEEKDAYS_ASCII="${WEEKDAYS_ASCII:-Mon Tue Wed Thu Fri Sat Sun}"
 
@@ -171,10 +185,104 @@ limit() { # $1 = ярлык, $2 = занято %, $3 = resets_at
   [ -n "$t" ] && printf ' \033[2m%s %s\033[0m' "$ARROW" "$t"
 }
 
+# ── лимиты отдельных моделей (Fable и т.п.) ───────────────────────────────────
+# Claude Code передаёт в statusline только 5h/7d, поэтому модельные недельные
+# окна берём из usage API сами: OAuth-токен из Keychain (macOS) или
+# ~/.claude/.credentials.json, ответ кешируем и обновляем в фоне.
+oauth_token() {
+  local raw
+  if [ "$OS" = macos ]; then
+    raw=$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null)
+  fi
+  [ -z "$raw" ] && [ -r "$HOME/.claude/.credentials.json" ] && raw=$(cat "$HOME/.claude/.credentials.json")
+  [ -n "$raw" ] && printf '%s' "$raw" | jq -r '.claudeAiOauth.accessToken // empty'
+}
+
+refresh_usage() { # в фоне: скачать usage в кеш, атомарно; на 429 запомнить, когда можно снова
+  local tok tmp hdr code retry
+  tok=$(oauth_token); [ -z "$tok" ] && return
+  tmp="$USAGE_CACHE.$$"; hdr="$tmp.hdr"
+  code=$(curl -s -m 8 -H "Authorization: Bearer $tok" -H "anthropic-beta: oauth-2025-04-20" \
+       "https://api.anthropic.com/api/oauth/usage" -o "$tmp" -D "$hdr" -w '%{http_code}' 2>/dev/null)
+  if [ "$code" = 200 ] && jq -e '.limits' "$tmp" >/dev/null 2>&1; then
+    mv -f "$tmp" "$USAGE_CACHE"; rm -f "$USAGE_CACHE.backoff"
+  else
+    retry=$(tr -d '\r' < "$hdr" 2>/dev/null | awk 'tolower($1)=="retry-after:"{print $2}')
+    case "$retry" in ''|*[!0-9]*) retry=$MODEL_LIMITS_TTL ;; esac
+    echo $(( $(date +%s) + retry )) > "$USAGE_CACHE.backoff"
+    rm -f "$tmp"
+  fi
+  rm -f "$hdr"
+}
+
+in_backoff() { # 0, если API просил подождать и срок ещё не вышел
+  local until
+  until=$(cat "$USAGE_CACHE.backoff" 2>/dev/null)
+  [ -n "$until" ] && [ "$(date +%s)" -lt "$until" ]
+}
+
+usage_age() { # возраст кеша в секундах (или 999999)
+  local m
+  jq -e '.limits' "$USAGE_CACHE" >/dev/null 2>&1 || { echo 999999; return; }   # нет или битый — считаем протухшим
+  if [ "$OS" = macos ]; then m=$(stat -f %m "$USAGE_CACHE" 2>/dev/null); else m=$(stat -c %Y "$USAGE_CACHE" 2>/dev/null); fi
+  echo $(( $(date +%s) - ${m:-0} ))
+}
+
+model_limits() {
+  [ "$MODEL_LIMITS" = 1 ] || return
+  [ -n "$(j '.rate_limits.seven_day.used_percentage')" ] || return   # нет подписочных лимитов — нечего показывать
+  command -v curl >/dev/null 2>&1 || return
+  mkdir -p "$(dirname "$USAGE_CACHE")" 2>/dev/null
+  if [ "$(usage_age)" -ge "$MODEL_LIMITS_TTL" ] && [ ! -f "$USAGE_CACHE.lock" ] && ! in_backoff; then
+    ( touch "$USAGE_CACHE.lock"; refresh_usage; rm -f "$USAGE_CACHE.lock" ) >/dev/null 2>&1 &
+    disown 2>/dev/null
+  fi
+  [ -f "$USAGE_CACHE" ] || return
+  # строки weekly_scoped: "<имя модели>\t<процент>\t<reset epoch>"
+  jq -r '(.limits // [])[] | select(.kind=="weekly_scoped" and .scope.model.display_name != null and .percent != null)
+         | [ .scope.model.display_name, (.percent|tostring),
+             ((.resets_at // "") | sub("\\.[0-9]+";"") | sub("\\+00:00$";"Z") | (try fromdateiso8601 catch "") | tostring) ]
+         | @tsv' "$USAGE_CACHE" 2>/dev/null |
+  while IFS=$'\t' read -r name pct ts; do
+    limit "$name" "$pct" "$ts"
+  done
+}
+
+# ── самообновление ────────────────────────────────────────────────────────────
+# Раз в SELF_UPDATE_TTL секунд в фоне скачиваем скрипт с GitHub и, если он
+# отличается и проходит bash -n, подменяем себя атомарно (mv — новый inode,
+# уже запущенный экземпляр это не трогает). Старая версия остаётся в .bak.
+self_update() {
+  local me tmp
+  me="${BASH_SOURCE[0]}"
+  [ "$SELF_UPDATE" = 1 ] && [ -w "$me" ] && command -v curl >/dev/null 2>&1 || return
+  case "$me" in */*) ;; *) return ;; esac       # запущены не по пути — не знаем, что обновлять
+  mkdir -p "$(dirname "$SELF_UPDATE_STAMP")" 2>/dev/null
+  if [ -f "$SELF_UPDATE_STAMP" ]; then
+    local m
+    if [ "$OS" = macos ]; then m=$(stat -f %m "$SELF_UPDATE_STAMP" 2>/dev/null); else m=$(stat -c %Y "$SELF_UPDATE_STAMP" 2>/dev/null); fi
+    [ $(( $(date +%s) - ${m:-0} )) -lt "$SELF_UPDATE_TTL" ] && return
+  fi
+  touch "$SELF_UPDATE_STAMP"
+  (
+    tmp="$me.new.$$"
+    if curl -sfL -m 15 "$SELF_UPDATE_URL" -o "$tmp" 2>/dev/null \
+       && head -c 2 "$tmp" | grep -q '^#!' && bash -n "$tmp" 2>/dev/null \
+       && ! cmp -s "$tmp" "$me"; then
+      cp -f "$me" "$me.bak" 2>/dev/null
+      chmod +x "$tmp" && mv -f "$tmp" "$me"
+    fi
+    rm -f "$tmp"
+  ) >/dev/null 2>&1 &
+  disown 2>/dev/null
+}
+self_update
+
 printf '\033[97m%s\033[0m \033[2m%s\033[0m \033[1;96m%s\033[0m%s' \
   "$(date +%H:%M)" "$SEP" "$model" "$effort_part"
 ctx
 limit "5h" "$(j '.rate_limits.five_hour.used_percentage')"  "$(j '.rate_limits.five_hour.resets_at')"
 limit "7d" "$(j '.rate_limits.seven_day.used_percentage')"  "$(j '.rate_limits.seven_day.resets_at')"
+model_limits
 printf '\n'
 printf '\033[1;93m%s\033[0m\033[1;92m%s\033[0m\n' "$dir_name" "$git_part"
