@@ -22,6 +22,7 @@ BAR_WIDTH="${BAR_WIDTH:-10}"
 MODEL_LIMITS="${MODEL_LIMITS:-1}"
 MODEL_LIMITS_TTL="${MODEL_LIMITS_TTL:-300}"
 USAGE_CACHE="${USAGE_CACHE:-$HOME/.claude/cache/statusline-usage.json}"
+LIMITS_STATE="${LIMITS_STATE:-$HOME/.claude/cache/statusline-limits.json}"
 SELF_UPDATE="${SELF_UPDATE:-1}"
 SELF_UPDATE_TTL="${SELF_UPDATE_TTL:-86400}"
 SELF_UPDATE_URL="${SELF_UPDATE_URL:-https://raw.githubusercontent.com/Daloshka/claude-code-statusline/main/statusline.sh}"
@@ -185,10 +186,15 @@ limit() { # $1 = ярлык, $2 = занято %, $3 = resets_at
   [ -n "$t" ] && printf ' \033[2m%s %s\033[0m' "$ARROW" "$t"
 }
 
-# ── лимиты отдельных моделей (Fable и т.п.) ───────────────────────────────────
-# Claude Code передаёт в statusline только 5h/7d, поэтому модельные недельные
-# окна берём из usage API сами: OAuth-токен из Keychain (macOS) или
-# ~/.claude/.credentials.json, ответ кешируем и обновляем в фоне.
+# ── лимиты: одна точка правды на все консоли ──────────────────────────────────
+# Каждая консоль Claude Code получает 5h/7d только из своего последнего ответа,
+# а модельные недельные окна (Fable) — только из usage API. Поэтому все
+# источники сливаются в общий файл LIMITS_STATE, и любая консоль рисует из него:
+#   • в пределах одного окна берём максимум (расход внутри окна только растёт);
+#   • окно с более поздним сбросом вытесняет старое;
+#   • истёкшее окно показываем как 0%.
+# Usage API опрашивает только одна консоль за раз (атомарный mkdir-замок),
+# ответ кешируется в USAGE_CACHE, пауза по 429 — общая в USAGE_CACHE.backoff.
 oauth_token() {
   local raw
   if [ "$OS" = macos ]; then
@@ -221,28 +227,75 @@ in_backoff() { # 0, если API просил подождать и срок е�
   [ -n "$until" ] && [ "$(date +%s)" -lt "$until" ]
 }
 
-usage_age() { # возраст кеша в секундах (или 999999)
-  local m
-  jq -e '.limits' "$USAGE_CACHE" >/dev/null 2>&1 || { echo 999999; return; }   # нет или битый — считаем протухшим
-  if [ "$OS" = macos ]; then m=$(stat -f %m "$USAGE_CACHE" 2>/dev/null); else m=$(stat -c %Y "$USAGE_CACHE" 2>/dev/null); fi
-  echo $(( $(date +%s) - ${m:-0} ))
+mtime() { # mtime файла в unix ts (или 0)
+  if [ "$OS" = macos ]; then stat -f %m "$1" 2>/dev/null || echo 0; else stat -c %Y "$1" 2>/dev/null || echo 0; fi
 }
 
-model_limits() {
+usage_age() { # возраст кеша в секундах (или 999999)
+  jq -e '.limits' "$USAGE_CACHE" >/dev/null 2>&1 || { echo 999999; return; }   # нет или битый — считаем протухшим
+  echo $(( $(date +%s) - $(mtime "$USAGE_CACHE") ))
+}
+
+take_lock() { # атомарный замок на опрос API; брошенный (старше 60 с) — снимаем
+  local l="$USAGE_CACHE.lock.d"
+  mkdir "$l" 2>/dev/null && return 0
+  [ $(( $(date +%s) - $(mtime "$l") )) -ge 60 ] || return 1
+  rmdir "$l" 2>/dev/null
+  mkdir "$l" 2>/dev/null
+}
+
+maybe_refresh_usage() {
   [ "$MODEL_LIMITS" = 1 ] || return
-  [ -n "$(j '.rate_limits.seven_day.used_percentage')" ] || return   # нет подписочных лимитов — нечего показывать
   command -v curl >/dev/null 2>&1 || return
-  mkdir -p "$(dirname "$USAGE_CACHE")" 2>/dev/null
-  if [ "$(usage_age)" -ge "$MODEL_LIMITS_TTL" ] && [ ! -f "$USAGE_CACHE.lock" ] && ! in_backoff; then
-    ( touch "$USAGE_CACHE.lock"; refresh_usage; rm -f "$USAGE_CACHE.lock" ) >/dev/null 2>&1 &
-    disown 2>/dev/null
+  [ "$(usage_age)" -ge "$MODEL_LIMITS_TTL" ] || return
+  in_backoff && return
+  take_lock || return
+  rm -f "$USAGE_CACHE.lock"    # замок-файл старых версий: мог остаться брошенным
+  ( refresh_usage; rmdir "$USAGE_CACHE.lock.d" ) >/dev/null 2>&1 &
+  disown 2>/dev/null
+}
+
+limits() {
+  local st api new tmp
+  [ -n "$(j '.rate_limits')" ] || return   # нет подписочных лимитов (API-ключ) — нечего показывать
+  mkdir -p "$(dirname "$LIMITS_STATE")" "$(dirname "$USAGE_CACHE")" 2>/dev/null
+  maybe_refresh_usage
+  st=$(cat "$LIMITS_STATE" 2>/dev/null);  printf '%s' "$st"  | jq -e 'type=="object"' >/dev/null 2>&1 || st='{}'
+  api=$(cat "$USAGE_CACHE" 2>/dev/null);  printf '%s' "$api" | jq -e 'type=="object"' >/dev/null 2>&1 || api='{}'
+  new=$(jq -cn --argjson st "$st" --argjson api "$api" --argjson now "$(date +%s)" --arg ml "$MODEL_LIMITS" \
+      --arg p5 "$(j '.rate_limits.five_hour.used_percentage')" --arg t5 "$(j '.rate_limits.five_hour.resets_at')" \
+      --arg p7 "$(j '.rate_limits.seven_day.used_percentage')" --arg t7 "$(j '.rate_limits.seven_day.resets_at')" '
+    def num: if . == null or . == "" then null else (tonumber? // null) end;
+    def iso: if . == null then null else (sub("\\.[0-9]+";"") | sub("\\+00:00$";"Z") | (fromdateiso8601? // null)) end;
+    def put($k; $p; $t):
+      if $p == null then . else
+        .[$k] as $o
+        | if $o == null or $o.ts == null or ($t != null and $t > $o.ts + 600) then .[$k] = {pct: $p, ts: $t}  # новое окно
+          elif $t == null then (if $o.ts < $now then .[$k] = {pct: $p, ts: null} else . end)
+          elif $t < $o.ts - 600 then .                                                                    # старое окно
+          else .[$k].pct = ([$o.pct, $p] | max) end
+      end;
+    $st
+    | put("5h"; $p5|num; $t5|num)
+    | put("7d"; $p7|num; $t7|num)
+    | put("5h"; $api.five_hour.utilization; $api.five_hour.resets_at|iso)
+    | put("7d"; $api.seven_day.utilization; $api.seven_day.resets_at|iso)
+    | reduce ((if $ml == "1" then $api.limits // [] else [] end)[]
+              | select(.kind == "weekly_scoped" and .scope.model.display_name != null and .percent != null)) as $l
+        (.; put($l.scope.model.display_name; $l.percent; $l.resets_at|iso))' 2>/dev/null)
+  [ -z "$new" ] && new="$st"
+  if [ "$new" != "$st" ]; then                     # пишем атомарно и только при изменениях
+    tmp="$LIMITS_STATE.$$"
+    printf '%s\n' "$new" > "$tmp" && mv -f "$tmp" "$LIMITS_STATE"
   fi
-  [ -f "$USAGE_CACHE" ] || return
-  # строки weekly_scoped: "<имя модели>\t<процент>\t<reset epoch>"
-  jq -r '(.limits // [])[] | select(.kind=="weekly_scoped" and .scope.model.display_name != null and .percent != null)
-         | [ .scope.model.display_name, (.percent|tostring),
-             ((.resets_at // "") | sub("\\.[0-9]+";"") | sub("\\+00:00$";"Z") | (try fromdateiso8601 catch "") | tostring) ]
-         | @tsv' "$USAGE_CACHE" 2>/dev/null |
+  # строки: "<ярлык>\t<процент>\t<reset epoch>"; истёкшее окно — 0% без времени
+  printf '%s' "$new" | jq -r --argjson now "$(date +%s)" --arg ml "$MODEL_LIMITS" '
+    . as $s
+    | (["5h","7d"] + (if $ml == "1" then (keys - ["5h","7d"]) else [] end))[]
+    | select($s[.] != null)
+    | . as $k | $s[$k]
+    | if .ts != null and .ts < $now then [$k, "0", ""] else [$k, (.pct|tostring), ((.ts // "")|tostring)] end
+    | @tsv' 2>/dev/null |
   while IFS=$'\t' read -r name pct ts; do
     limit "$name" "$pct" "$ts"
   done
@@ -281,8 +334,6 @@ self_update
 printf '\033[97m%s\033[0m \033[2m%s\033[0m \033[1;96m%s\033[0m%s' \
   "$(date +%H:%M)" "$SEP" "$model" "$effort_part"
 ctx
-limit "5h" "$(j '.rate_limits.five_hour.used_percentage')"  "$(j '.rate_limits.five_hour.resets_at')"
-limit "7d" "$(j '.rate_limits.seven_day.used_percentage')"  "$(j '.rate_limits.seven_day.resets_at')"
-model_limits
+limits
 printf '\n'
 printf '\033[1;93m%s\033[0m\033[1;92m%s\033[0m\n' "$dir_name" "$git_part"
